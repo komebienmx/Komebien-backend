@@ -3,20 +3,44 @@ const https = require('https');
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.ANTHROPIC_API_KEY;
+const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY;
+
+const CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+  'Content-Type': 'application/json'
+};
 
 const server = http.createServer(async (req, res) => {
-  // CORS headers
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Content-Type', 'application/json');
-
   if (req.method === 'OPTIONS') {
-    res.writeHead(200);
+    res.writeHead(200, CORS);
     res.end();
     return;
   }
 
+  // Health check
+  if (req.method === 'GET' && req.url === '/health') {
+    res.writeHead(200, CORS);
+    res.end(JSON.stringify({ status: 'ok', service: 'Komebien API' }));
+    return;
+  }
+
+  // Firebase config endpoint
+  if (req.method === 'GET' && req.url === '/config') {
+    res.writeHead(200, CORS);
+    res.end(JSON.stringify({
+      apiKey: FIREBASE_API_KEY || '',
+      authDomain: "komebienmx.firebaseapp.com",
+      projectId: "komebienmx",
+      storageBucket: "komebienmx.firebasestorage.app",
+      messagingSenderId: "465748859151",
+      appId: "1:465748859151:web:1b7ace721717434ed9467a"
+    }));
+    return;
+  }
+
+  // Claude API proxy
   if (req.method === 'POST' && req.url === '/claude') {
     let body = '';
     req.on('data', chunk => body += chunk.toString());
@@ -24,20 +48,19 @@ const server = http.createServer(async (req, res) => {
       try {
         const { prompt } = JSON.parse(body);
         if (!prompt) {
-          res.writeHead(400);
+          res.writeHead(400, CORS);
           res.end(JSON.stringify({ error: 'Prompt requerido' }));
           return;
         }
-
         if (!API_KEY) {
-          res.writeHead(500);
+          res.writeHead(500, CORS);
           res.end(JSON.stringify({ error: 'API key no configurada' }));
           return;
         }
 
         const postData = JSON.stringify({
-          model: 'claude-haiku-4-5-20251001',
-          max_tokens: 6000,
+          model: 'claude-sonnet-4-6',
+          max_tokens: 2000,
           messages: [{ role: 'user', content: prompt }]
         });
 
@@ -58,18 +81,18 @@ const server = http.createServer(async (req, res) => {
           apiRes.on('data', chunk => data += chunk);
           apiRes.on('end', () => {
             if (apiRes.statusCode !== 200) {
-              res.writeHead(apiRes.statusCode);
+              res.writeHead(apiRes.statusCode, CORS);
               res.end(JSON.stringify({ error: data }));
               return;
             }
             const parsed = JSON.parse(data);
-            res.writeHead(200);
+            res.writeHead(200, CORS);
             res.end(JSON.stringify({ content: parsed.content }));
           });
         });
 
         apiReq.on('error', (e) => {
-          res.writeHead(500);
+          res.writeHead(500, CORS);
           res.end(JSON.stringify({ error: e.message }));
         });
 
@@ -77,20 +100,14 @@ const server = http.createServer(async (req, res) => {
         apiReq.end();
 
       } catch(e) {
-        res.writeHead(500);
+        res.writeHead(500, CORS);
         res.end(JSON.stringify({ error: e.message }));
       }
     });
     return;
   }
 
-  if (req.method === 'GET' && req.url === '/health') {
-    res.writeHead(200);
-    res.end(JSON.stringify({ status: 'ok', service: 'Komebien API' }));
-    return;
-  }
-
-  res.writeHead(404);
+  res.writeHead(404, CORS);
   res.end(JSON.stringify({ error: 'Not found' }));
 });
 
