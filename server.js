@@ -80,14 +80,25 @@ const server = http.createServer(async (req, res) => {
           let data = '';
           apiRes.on('data', chunk => data += chunk);
           apiRes.on('end', () => {
+            console.log('Claude status:', apiRes.statusCode);
+            console.log('Claude response length:', data.length);
             if (apiRes.statusCode !== 200) {
               res.writeHead(apiRes.statusCode, CORS);
               res.end(JSON.stringify({ error: data }));
               return;
             }
-            const parsed = JSON.parse(data);
-            res.writeHead(200, CORS);
-            res.end(JSON.stringify({ content: parsed.content }));
+            try {
+              const parsed = JSON.parse(data);
+              const text = parsed.content[0].text;
+              console.log('Text length:', text.length);
+              console.log('Last 100 chars:', text.slice(-100));
+              res.writeHead(200, CORS);
+              res.end(JSON.stringify({ content: parsed.content }));
+            } catch(parseErr) {
+              console.log('Parse error:', parseErr.message);
+              res.writeHead(500, CORS);
+              res.end(JSON.stringify({ error: 'Parse error: ' + parseErr.message }));
+            }
           });
         });
 
