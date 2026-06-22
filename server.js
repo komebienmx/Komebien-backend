@@ -1,12 +1,29 @@
 const http = require('http');
 const https = require('https');
+const fs = require('fs');
 const Stripe = require('stripe');
+const admin = require('firebase-admin');
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.ANTHROPIC_API_KEY;
 const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY;
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 const stripe = STRIPE_SECRET_KEY ? Stripe(STRIPE_SECRET_KEY) : null;
+
+// Firebase Admin SDK — used to write to Firestore bypassing security rules
+let firebaseAdminReady = false;
+try {
+  const serviceAccountPath = fs.existsSync('/etc/secrets/firebase-service-account.json')
+    ? '/etc/secrets/firebase-service-account.json'
+    : './firebase-service-account.json';
+  const serviceAccount = JSON.parse(fs.readFileSync(serviceAccountPath, 'utf8'));
+  admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+  firebaseAdminReady = true;
+  console.log('Firebase Admin SDK inicializado ✓');
+} catch(e) {
+  console.log('Firebase Admin no disponible:', e.message);
+}
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -157,6 +174,58 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(500, CORS);
         res.end(JSON.stringify({ error: e.message }));
       }
+    });
+    return;
+  }
+
+  // Stripe webhook: marks user as Pro in Firestore after successful payment
+  if (req.method === 'POST' && req.url === '/webhook') {
+    let rawBody = '';
+    req.on('data', chunk => rawBody += chunk.toString());
+    req.on('end', async () => {
+      const sig = req.headers['stripe-signature'];
+      let event;
+      try {
+        event = stripe.webhooks.constructEvent(rawBody, sig, STRIPE_WEBHOOK_SECRET);
+      } catch(err) {
+        console.log('Webhook signature inválida:', err.message);
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('Webhook Error: ' + err.message);
+        return;
+      }
+
+      try {
+        if (!firebaseAdminReady) {
+          console.log('Webhook recibido pero Firebase Admin no está listo');
+        } else if (event.type === 'checkout.session.completed') {
+          const session = event.data.object;
+          const uid = session.client_reference_id || (session.metadata && session.metadata.uid);
+          if (uid) {
+            await admin.firestore().collection('usuarios').doc(uid).set({
+              suscripcion: {
+                activa: true,
+                stripeCustomerId: session.customer,
+                stripeSubscriptionId: session.subscription,
+                fechaInicio: new Date().toISOString()
+              }
+            }, { merge: true });
+            console.log('✓ Usuario marcado como Pro:', uid);
+          }
+        } else if (event.type === 'customer.subscription.deleted') {
+          const sub = event.data.object;
+          const snap = await admin.firestore().collection('usuarios')
+            .where('suscripcion.stripeCustomerId', '==', sub.customer).get();
+          const batch = admin.firestore().batch();
+          snap.forEach(doc => batch.set(doc.ref, { suscripcion: { activa: false } }, { merge: true }));
+          await batch.commit();
+          console.log('✓ Suscripción cancelada para customer:', sub.customer);
+        }
+      } catch(e) {
+        console.log('Error procesando webhook:', e.message);
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ received: true }));
     });
     return;
   }
