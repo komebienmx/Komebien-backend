@@ -1,9 +1,12 @@
 const http = require('http');
 const https = require('https');
+const Stripe = require('stripe');
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.ANTHROPIC_API_KEY;
 const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY;
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+const stripe = STRIPE_SECRET_KEY ? Stripe(STRIPE_SECRET_KEY) : null;
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -111,6 +114,46 @@ const server = http.createServer(async (req, res) => {
         apiReq.end();
 
       } catch(e) {
+        res.writeHead(500, CORS);
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // Stripe: create checkout session for subscription
+  if (req.method === 'POST' && req.url === '/create-checkout-session') {
+    let body = '';
+    req.on('data', chunk => body += chunk.toString());
+    req.on('end', async () => {
+      try {
+        const { priceId, uid, email } = JSON.parse(body);
+        if (!priceId || !uid) {
+          res.writeHead(400, CORS);
+          res.end(JSON.stringify({ error: 'priceId y uid son requeridos' }));
+          return;
+        }
+        if (!stripe) {
+          res.writeHead(500, CORS);
+          res.end(JSON.stringify({ error: 'Stripe no configurado en el servidor' }));
+          return;
+        }
+
+        const session = await stripe.checkout.sessions.create({
+          mode: 'subscription',
+          payment_method_types: ['card'],
+          line_items: [{ price: priceId, quantity: 1 }],
+          client_reference_id: uid,
+          customer_email: email || undefined,
+          success_url: 'https://app.komebien.mx/?checkout=success',
+          cancel_url: 'https://app.komebien.mx/?checkout=cancel',
+          metadata: { uid }
+        });
+
+        res.writeHead(200, CORS);
+        res.end(JSON.stringify({ url: session.url }));
+      } catch(e) {
+        console.log('Stripe checkout error:', e.message);
         res.writeHead(500, CORS);
         res.end(JSON.stringify({ error: e.message }));
       }
