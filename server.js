@@ -96,39 +96,53 @@ const server = http.createServer(async (req, res) => {
           }
         };
 
-        const apiReq = https.request(options, (apiRes) => {
-          let data = '';
-          apiRes.on('data', chunk => data += chunk);
-          apiRes.on('end', () => {
-            console.log('Claude status:', apiRes.statusCode);
-            console.log('Claude response length:', data.length);
-            if (apiRes.statusCode !== 200) {
-              res.writeHead(apiRes.statusCode, CORS);
-              res.end(JSON.stringify({ error: data }));
+        // Transient errors (overloaded/server hiccups) get automatic retries
+        // before we give up and tell the user — covers brief Anthropic blips
+        const RETRYABLE_STATUSES = [429, 500, 502, 503, 529];
+        const MAX_ATTEMPTS = 3;
+        const callAnthropic = (attempt) => {
+          const apiReq = https.request(options, (apiRes) => {
+            let data = '';
+            apiRes.on('data', chunk => data += chunk);
+            apiRes.on('end', () => {
+              console.log(`Claude status (intento ${attempt}):`, apiRes.statusCode);
+              if (apiRes.statusCode !== 200) {
+                if (RETRYABLE_STATUSES.includes(apiRes.statusCode) && attempt < MAX_ATTEMPTS) {
+                  const wait = attempt * 2000; // 2s, 4s
+                  console.log(`Reintentando en ${wait}ms...`);
+                  setTimeout(() => callAnthropic(attempt + 1), wait);
+                  return;
+                }
+                res.writeHead(apiRes.statusCode, CORS);
+                res.end(JSON.stringify({ error: data, transient: RETRYABLE_STATUSES.includes(apiRes.statusCode) }));
+                return;
+              }
+              try {
+                const parsed = JSON.parse(data);
+                const text = parsed.content[0].text;
+                console.log('Text length:', text.length);
+                res.writeHead(200, CORS);
+                res.end(JSON.stringify({ content: parsed.content }));
+              } catch(parseErr) {
+                console.log('Parse error:', parseErr.message);
+                res.writeHead(500, CORS);
+                res.end(JSON.stringify({ error: 'Parse error: ' + parseErr.message }));
+              }
+            });
+          });
+          apiReq.on('error', (e) => {
+            if (attempt < MAX_ATTEMPTS) {
+              const wait = attempt * 2000;
+              setTimeout(() => callAnthropic(attempt + 1), wait);
               return;
             }
-            try {
-              const parsed = JSON.parse(data);
-              const text = parsed.content[0].text;
-              console.log('Text length:', text.length);
-              console.log('Last 100 chars:', text.slice(-100));
-              res.writeHead(200, CORS);
-              res.end(JSON.stringify({ content: parsed.content }));
-            } catch(parseErr) {
-              console.log('Parse error:', parseErr.message);
-              res.writeHead(500, CORS);
-              res.end(JSON.stringify({ error: 'Parse error: ' + parseErr.message }));
-            }
+            res.writeHead(500, CORS);
+            res.end(JSON.stringify({ error: e.message, transient: true }));
           });
-        });
-
-        apiReq.on('error', (e) => {
-          res.writeHead(500, CORS);
-          res.end(JSON.stringify({ error: e.message }));
-        });
-
-        apiReq.write(postData);
-        apiReq.end();
+          apiReq.write(postData);
+          apiReq.end();
+        };
+        callAnthropic(1);
 
       } catch(e) {
         res.writeHead(500, CORS);
@@ -237,3 +251,5 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`Komebien backend running on port ${PORT}`);
 });
+
+      
