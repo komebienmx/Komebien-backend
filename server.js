@@ -192,6 +192,40 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Stripe: create a Customer Portal session so users can manage/cancel their own subscription
+  if (req.method === 'POST' && req.url === '/create-portal-session') {
+    let body = '';
+    req.on('data', chunk => body += chunk.toString());
+    req.on('end', async () => {
+      try {
+        const { customerId } = JSON.parse(body);
+        if (!customerId) {
+          res.writeHead(400, CORS);
+          res.end(JSON.stringify({ error: 'customerId es requerido' }));
+          return;
+        }
+        if (!stripe) {
+          res.writeHead(500, CORS);
+          res.end(JSON.stringify({ error: 'Stripe no configurado en el servidor' }));
+          return;
+        }
+
+        const session = await stripe.billingPortal.sessions.create({
+          customer: customerId,
+          return_url: 'https://app.komebien.mx/'
+        });
+
+        res.writeHead(200, CORS);
+        res.end(JSON.stringify({ url: session.url }));
+      } catch(e) {
+        console.log('Stripe portal error:', e.message);
+        res.writeHead(500, CORS);
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
   // Stripe webhook: marks user as Pro in Firestore after successful payment
   if (req.method === 'POST' && req.url === '/webhook') {
     let rawBody = '';
@@ -251,5 +285,3 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`Komebien backend running on port ${PORT}`);
 });
-
-      
