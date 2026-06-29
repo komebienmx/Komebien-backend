@@ -176,6 +176,7 @@ const server = http.createServer(async (req, res) => {
           line_items: [{ price: priceId, quantity: 1 }],
           client_reference_id: uid,
           customer_email: email || undefined,
+          allow_promotion_codes: true,
           success_url: 'https://app.komebien.mx/?checkout=success',
           cancel_url: 'https://app.komebien.mx/?checkout=cancel',
           metadata: { uid }
