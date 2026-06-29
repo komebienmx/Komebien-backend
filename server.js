@@ -250,15 +250,17 @@ const server = http.createServer(async (req, res) => {
           const session = event.data.object;
           const uid = session.client_reference_id || (session.metadata && session.metadata.uid);
           if (uid) {
+            const montoMensual = typeof session.amount_total === 'number' ? session.amount_total / 100 : null;
             await admin.firestore().collection('usuarios').doc(uid).set({
               suscripcion: {
                 activa: true,
                 stripeCustomerId: session.customer,
                 stripeSubscriptionId: session.subscription,
+                montoMensual,
                 fechaInicio: new Date().toISOString()
               }
             }, { merge: true });
-            console.log('✓ Usuario marcado como Pro:', uid);
+            console.log('✓ Usuario marcado como Pro:', uid, '— $' + montoMensual + ' MXN');
           }
         } else if (event.type === 'customer.subscription.deleted') {
           const sub = event.data.object;
