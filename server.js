@@ -251,16 +251,31 @@ const server = http.createServer(async (req, res) => {
           const uid = session.client_reference_id || (session.metadata && session.metadata.uid);
           if (uid) {
             const montoMensual = typeof session.amount_total === 'number' ? session.amount_total / 100 : null;
+            // Fetch the full session with discount details expanded, to know if a coupon was used
+            let cuponUsado = null;
+            try {
+              const fullSession = await stripe.checkout.sessions.retrieve(session.id, {
+                expand: ['total_details.breakdown.discounts']
+              });
+              const discounts = fullSession.total_details && fullSession.total_details.breakdown && fullSession.total_details.breakdown.discounts;
+              if (discounts && discounts.length > 0) {
+                cuponUsado = discounts[0].discount && discounts[0].discount.coupon
+                  ? (discounts[0].discount.coupon.name || discounts[0].discount.coupon.id)
+                  : null;
+              }
+            } catch(expandErr) { console.log('No se pudo expandir cupón:', expandErr.message); }
+
             await admin.firestore().collection('usuarios').doc(uid).set({
               suscripcion: {
                 activa: true,
                 stripeCustomerId: session.customer,
                 stripeSubscriptionId: session.subscription,
                 montoMensual,
+                cuponUsado,
                 fechaInicio: new Date().toISOString()
               }
             }, { merge: true });
-            console.log('✓ Usuario marcado como Pro:', uid, '— $' + montoMensual + ' MXN');
+            console.log('✓ Usuario marcado como Pro:', uid, '— $' + montoMensual + ' MXN' + (cuponUsado ? ' (cupón: ' + cuponUsado + ')' : ''));
           }
         } else if (event.type === 'customer.subscription.deleted') {
           const sub = event.data.object;
@@ -277,6 +292,44 @@ const server = http.createServer(async (req, res) => {
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ received: true }));
+    });
+    return;
+  }
+
+  // TEMPORARY admin endpoint: bulk-upload the curated recipe bank to Firestore.
+  // Protected by a simple secret key check (not meant to stay long-term — remove once
+  // the recipe bank is fully uploaded and confirmed working).
+  if (req.method === 'POST' && req.url === '/admin-upload-recetas') {
+    let body = '';
+    req.on('data', chunk => body += chunk.toString());
+    req.on('end', async () => {
+      try {
+        const { secret, recetas } = JSON.parse(body);
+        if (secret !== process.env.ADMIN_UPLOAD_SECRET) {
+          res.writeHead(403, CORS);
+          res.end(JSON.stringify({ error: 'No autorizado' }));
+          return;
+        }
+        if (!Array.isArray(recetas) || recetas.length === 0) {
+          res.writeHead(400, CORS);
+          res.end(JSON.stringify({ error: 'recetas debe ser un array no vacío' }));
+          return;
+        }
+        const db = admin.firestore();
+        const batch = db.batch();
+        recetas.forEach(receta => {
+          const ref = db.collection('banco_maestro_recetas').doc(receta.id);
+          batch.set(ref, receta);
+        });
+        await batch.commit();
+        console.log(`✓ Banco de recetas subido: ${recetas.length} recetas`);
+        res.writeHead(200, CORS);
+        res.end(JSON.stringify({ ok: true, subidas: recetas.length }));
+      } catch(e) {
+        console.log('Error subiendo banco de recetas:', e.message);
+        res.writeHead(500, CORS);
+        res.end(JSON.stringify({ error: e.message }));
+      }
     });
     return;
   }
