@@ -334,6 +334,31 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Verification endpoint: confirms how many recipes actually exist in Firestore,
+  // broken down by objetivo/tipo, plus one sample recipe to sanity-check the data.
+  if (req.method === 'GET' && req.url === '/admin-verificar-recetas') {
+    (async () => {
+      try {
+        const db = admin.firestore();
+        const snap = await db.collection('banco_maestro_recetas').get();
+        const conteo = {};
+        let ejemplo = null;
+        snap.forEach(doc => {
+          const d = doc.data();
+          const key = `${d.objetivo} - ${d.tipo}`;
+          conteo[key] = (conteo[key] || 0) + 1;
+          if (!ejemplo) ejemplo = { id: doc.id, nombre: d.nombre, objetivo: d.objetivo, tipo: d.tipo };
+        });
+        res.writeHead(200, CORS);
+        res.end(JSON.stringify({ total: snap.size, conteo, ejemplo }, null, 2));
+      } catch(e) {
+        res.writeHead(500, CORS);
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    })();
+    return;
+  }
+
   res.writeHead(404, CORS);
   res.end(JSON.stringify({ error: 'Not found' }));
 });
