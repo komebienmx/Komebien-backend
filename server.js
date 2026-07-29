@@ -298,13 +298,14 @@ const server = http.createServer(async (req, res) => {
 
   // TEMPORARY admin endpoint: bulk-upload the curated recipe bank to Firestore.
   // Protected by a simple secret key check (not meant to stay long-term — remove once
-  // the recipe bank is fully uploaded and confirmed working).
+  // the recipe bank is fully uploaded and confirmed working). Also used for the
+  // separate salsas_casa collection via the optional "coleccion" parameter.
   if (req.method === 'POST' && req.url === '/admin-upload-recetas') {
     let body = '';
     req.on('data', chunk => body += chunk.toString());
     req.on('end', async () => {
       try {
-        const { secret, recetas } = JSON.parse(body);
+        const { secret, recetas, coleccion } = JSON.parse(body);
         if (secret !== process.env.ADMIN_UPLOAD_SECRET) {
           res.writeHead(403, CORS);
           res.end(JSON.stringify({ error: 'No autorizado' }));
@@ -315,18 +316,19 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ error: 'recetas debe ser un array no vacío' }));
           return;
         }
+        const coleccionDestino = coleccion === 'salsas_casa' ? 'salsas_casa' : 'banco_maestro_recetas';
         const db = admin.firestore();
         const batch = db.batch();
         recetas.forEach(receta => {
-          const ref = db.collection('banco_maestro_recetas').doc(receta.id);
+          const ref = db.collection(coleccionDestino).doc(receta.id);
           batch.set(ref, receta);
         });
         await batch.commit();
-        console.log(`✓ Banco de recetas subido: ${recetas.length} recetas`);
+        console.log(`✓ Subido a ${coleccionDestino}: ${recetas.length} documentos`);
         res.writeHead(200, CORS);
-        res.end(JSON.stringify({ ok: true, subidas: recetas.length }));
+        res.end(JSON.stringify({ ok: true, subidas: recetas.length, coleccion: coleccionDestino }));
       } catch(e) {
-        console.log('Error subiendo banco de recetas:', e.message);
+        console.log('Error subiendo:', e.message);
         res.writeHead(500, CORS);
         res.end(JSON.stringify({ error: e.message }));
       }
