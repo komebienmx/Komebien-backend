@@ -9,6 +9,16 @@ const API_KEY = process.env.ANTHROPIC_API_KEY;
 const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY;
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+
+// Gym pilot program: maps each pilot coupon (100% off, temporary) to the renewal coupon
+// that should auto-apply once the free period ends (e.g. a permanent 30% discount for
+// gym socios/dueños). Update this map by hand as new gym partnerships are set up —
+// low volume for now, so a simple object is easier to reason about than a database table.
+// IMPORTANT: coupon names here must match the "name" (or id) exactly as created in Stripe.
+const PILOT_RENEWAL_COUPONS = {
+  // 'NOMBRE_CUPON_PILOTO': 'NOMBRE_CUPON_RENOVACION',
+  'METCON': 'METCON30', // Metcon House Cumbres — socios: 3 meses gratis → 30% fijo de por vida
+};
 const stripe = STRIPE_SECRET_KEY ? Stripe(STRIPE_SECRET_KEY) : null;
 
 // Firebase Admin SDK — used to write to Firestore bypassing security rules
@@ -265,6 +275,11 @@ const server = http.createServer(async (req, res) => {
               }
             } catch(expandErr) { console.log('No se pudo expandir cupón:', expandErr.message); }
 
+            // Gym pilot tracking: if this signup used one of the known gym pilot coupons
+            // (100% off for N months), remember which renewal coupon to auto-apply once
+            // that free period ends — see PILOT_RENEWAL_COUPONS below.
+            const renewalCoupon = cuponUsado && PILOT_RENEWAL_COUPONS[cuponUsado] ? PILOT_RENEWAL_COUPONS[cuponUsado] : null;
+
             await admin.firestore().collection('usuarios').doc(uid).set({
               suscripcion: {
                 activa: true,
@@ -272,10 +287,59 @@ const server = http.createServer(async (req, res) => {
                 stripeSubscriptionId: session.subscription,
                 montoMensual,
                 cuponUsado,
+                renewalCoupon,
                 fechaInicio: new Date().toISOString()
               }
             }, { merge: true });
-            console.log('✓ Usuario marcado como Pro:', uid, '— $' + montoMensual + ' MXN' + (cuponUsado ? ' (cupón: ' + cuponUsado + ')' : ''));
+            console.log('✓ Usuario marcado como Pro:', uid, '— $' + montoMensual + ' MXN' + (cuponUsado ? ' (cupón: ' + cuponUsado + ')' : '') + (renewalCoupon ? ' [renovación: ' + renewalCoupon + ']' : ''));
+          }
+        } else if (event.type === 'customer.subscription.updated') {
+          // Detect when a subscription's discount just expired (transitioned from having
+          // a discount to having none) — this is how we know a gym pilot's free period
+          // (3 or 6 months at 100% off) just ended. Stripe's previous_attributes tells us
+          // what changed since the last event, so we only act on the actual transition,
+          // not on every subscription update.
+          const sub = event.data.object;
+          const previousAttrs = event.data.previous_attributes || {};
+          const teniaDescuento = previousAttrs.hasOwnProperty('discount');
+          const yaNoTieneDescuento = !sub.discount;
+          if (teniaDescuento && yaNoTieneDescuento) {
+            const snap = await admin.firestore().collection('usuarios')
+              .where('suscripcion.stripeCustomerId', '==', sub.customer).limit(1).get();
+            if (!snap.empty) {
+              const userDoc = snap.docs[0];
+              const suscripcionData = userDoc.data().suscripcion || {};
+              const renewalCoupon = suscripcionData.renewalCoupon;
+              const cuponUsado = suscripcionData.cuponUsado;
+
+              if (renewalCoupon) {
+                // Gym pilot flow: auto-apply the permanent discount coupon.
+                try {
+                  await stripe.subscriptions.update(sub.id, { coupon: renewalCoupon });
+                  await userDoc.ref.set({ suscripcion: { renewalCouponApplied: true, renewalAppliedFecha: new Date().toISOString() } }, { merge: true });
+                  console.log(`✓ Cupón de renovación "${renewalCoupon}" aplicado automáticamente a`, userDoc.id);
+                } catch(renewErr) {
+                  console.log('Error aplicando cupón de renovación:', renewErr.message);
+                }
+              } else if (cuponUsado && /50$/i.test(cuponUsado)) {
+                // Referral program flow: coupons named like "JUAN50", "MARIA50" (any name
+                // ending in "50") mark a referred signup. No second coupon is applied here
+                // — referrer payouts are manual (a bank transfer Armando sends by hand once
+                // a month), so we just flag that this referral is now "confirmed" (the
+                // referred user made it past their discounted first month and started
+                // paying full price), along with which referrer coupon it came from, so the
+                // admin dashboard can group and total how much is owed to each referrer.
+                const referrerName = cuponUsado.replace(/50$/i, '');
+                await userDoc.ref.set({
+                  suscripcion: {
+                    referidoConfirmado: true,
+                    referidoPor: referrerName,
+                    referidoConfirmadoFecha: new Date().toISOString()
+                  }
+                }, { merge: true });
+                console.log(`✓ Referido confirmado — cupón "${cuponUsado}" (referidor: ${referrerName}) —`, userDoc.id);
+              }
+            }
           }
         } else if (event.type === 'customer.subscription.deleted') {
           const sub = event.data.object;
@@ -329,6 +393,128 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ ok: true, subidas: recetas.length, coleccion: coleccionDestino }));
       } catch(e) {
         console.log('Error subiendo:', e.message);
+        res.writeHead(500, CORS);
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // Referral program summary: groups confirmed referrals by referrer name, so Armando
+  // can see at a glance who to pay and how much (manual bank transfer, $50 MXN per
+  // confirmed referral as of this writing — adjust PAGO_POR_REFERIDO if that changes).
+  if (req.method === 'GET' && req.url === '/admin-referidos') {
+    (async () => {
+      try {
+        const PAGO_POR_REFERIDO = 50; // MXN — update here if the referral payout amount changes
+        const db = admin.firestore();
+        const snap = await db.collection('usuarios')
+          .where('suscripcion.referidoConfirmado', '==', true).get();
+        const porReferidor = {};
+        snap.forEach(doc => {
+          const s = doc.data().suscripcion || {};
+          const ref = s.referidoPor || 'desconocido';
+          if (!porReferidor[ref]) porReferidor[ref] = { referidos: 0, aPagar: 0 };
+          porReferidor[ref].referidos += 1;
+          porReferidor[ref].aPagar += PAGO_POR_REFERIDO;
+        });
+        res.writeHead(200, CORS);
+        res.end(JSON.stringify({ total: snap.size, pagoPorReferido: PAGO_POR_REFERIDO, porReferidor }, null, 2));
+      } catch(e) {
+        res.writeHead(500, CORS);
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    })();
+    return;
+  }
+
+  // Gym commission summary: UNLIKE referrals (one-time payment), this is a RECURRING
+  // monthly commission that only counts socios who are both (a) past their free pilot
+  // period — i.e. their renewal coupon already kicked in, meaning they're actually
+  // paying — and (b) still active today. A socio who cancels simply stops counting the
+  // next time this is checked; there's no separate "confirmed once" flag like referrals,
+  // since the amount owed changes month to month based on who's still around.
+  // Keyed by the ORIGINAL pilot coupon name (e.g. "METCON"), matching PILOT_RENEWAL_COUPONS,
+  // since that's what stays on the user's record even after the renewal coupon applies.
+  const GYM_COMMISSIONS = {
+    'METCON': { gimnasio: 'Metcon House', comisionPorSocio: 30 },
+  };
+  if (req.method === 'GET' && req.url === '/admin-comisiones-gym') {
+    (async () => {
+      try {
+        const db = admin.firestore();
+        const snap = await db.collection('usuarios')
+          .where('suscripcion.renewalCouponApplied', '==', true)
+          .where('suscripcion.activa', '==', true)
+          .get();
+        const porGym = {};
+        snap.forEach(doc => {
+          const s = doc.data().suscripcion || {};
+          const config = GYM_COMMISSIONS[s.cuponUsado];
+          if (!config) return; // socio came from a pilot coupon not (yet) in the commission map
+          if (!porGym[config.gimnasio]) porGym[config.gimnasio] = { sociosActivos: 0, aPagarEsteMes: 0 };
+          porGym[config.gimnasio].sociosActivos += 1;
+          porGym[config.gimnasio].aPagarEsteMes += config.comisionPorSocio;
+        });
+        res.writeHead(200, CORS);
+        res.end(JSON.stringify({ nota: 'Comisión recurrente — recalcular cada mes antes de transferir', porGym }, null, 2));
+      } catch(e) {
+        res.writeHead(500, CORS);
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    })();
+    return;
+  }
+
+  // TEMPORARY manual test endpoint: simulates exactly what the customer.subscription.updated
+  // webhook handler does when a discount expires, without needing to wait for a real Stripe
+  // discount to actually run out (which would take 3 real months for the Metcon pilot).
+  // This lets Armando verify OUR renewal/commission logic works correctly on a real test
+  // subscription right now, trusting that Stripe's own webhook delivery (separate, well-
+  // tested infrastructure) will fire the real event correctly when the time actually comes.
+  // Remove this endpoint once the Metcon pilot is running smoothly and confidence is high.
+  if (req.method === 'POST' && req.url === '/admin-test-vencimiento') {
+    let body = '';
+    req.on('data', chunk => body += chunk.toString());
+    req.on('end', async () => {
+      try {
+        const { secret, stripeSubscriptionId } = JSON.parse(body);
+        if (secret !== process.env.ADMIN_UPLOAD_SECRET) {
+          res.writeHead(403, CORS);
+          res.end(JSON.stringify({ error: 'No autorizado' }));
+          return;
+        }
+        if (!stripeSubscriptionId) {
+          res.writeHead(400, CORS);
+          res.end(JSON.stringify({ error: 'Falta stripeSubscriptionId' }));
+          return;
+        }
+        const db = admin.firestore();
+        const snap = await db.collection('usuarios')
+          .where('suscripcion.stripeSubscriptionId', '==', stripeSubscriptionId).limit(1).get();
+        if (snap.empty) {
+          res.writeHead(404, CORS);
+          res.end(JSON.stringify({ error: 'No se encontró un usuario con ese stripeSubscriptionId' }));
+          return;
+        }
+        const userDoc = snap.docs[0];
+        const s = userDoc.data().suscripcion || {};
+        const resultado = { uid: userDoc.id, cuponUsado: s.cuponUsado, accion: null };
+
+        if (s.renewalCoupon) {
+          await stripe.subscriptions.update(stripeSubscriptionId, { coupon: s.renewalCoupon });
+          await userDoc.ref.set({ suscripcion: { renewalCouponApplied: true, renewalAppliedFecha: new Date().toISOString() } }, { merge: true });
+          resultado.accion = `Cupón de renovación "${s.renewalCoupon}" aplicado (simulado)`;
+        } else if (s.cuponUsado && /50$/i.test(s.cuponUsado)) {
+          const referrerName = s.cuponUsado.replace(/50$/i, '');
+          await userDoc.ref.set({ suscripcion: { referidoConfirmado: true, referidoPor: referrerName, referidoConfirmadoFecha: new Date().toISOString() } }, { merge: true });
+          resultado.accion = `Referido confirmado (simulado) — referidor: ${referrerName}`;
+        } else {
+          resultado.accion = 'Este usuario no tiene renewalCoupon ni cupón de referido — nada que simular';
+        }
+        res.writeHead(200, CORS);
+        res.end(JSON.stringify(resultado, null, 2));
+      } catch(e) {
         res.writeHead(500, CORS);
         res.end(JSON.stringify({ error: e.message }));
       }
