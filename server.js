@@ -19,6 +19,15 @@ const PILOT_RENEWAL_COUPONS = {
   // 'NOMBRE_CUPON_PILOTO': 'NOMBRE_CUPON_RENOVACION',
   'METCON': 'METCON30', // Metcon House Cumbres — socios: 3 meses gratis → 30% fijo de por vida
 };
+// Case-insensitive lookup: Stripe's coupon "name" field can end up differently cased than
+// what was typed as the coupon "id" (e.g. displayed as "Metcon" instead of "METCON"), and
+// a strict PILOT_RENEWAL_COUPONS[cuponUsado] lookup silently fails on any case mismatch —
+// this bit us on the very first real test. Normalize both sides to uppercase before comparing.
+function buscarCuponRenovacion(cuponUsado) {
+  if (!cuponUsado) return null;
+  const clave = Object.keys(PILOT_RENEWAL_COUPONS).find(k => k.toUpperCase() === cuponUsado.toUpperCase());
+  return clave ? PILOT_RENEWAL_COUPONS[clave] : null;
+}
 const stripe = STRIPE_SECRET_KEY ? Stripe(STRIPE_SECRET_KEY) : null;
 
 // Firebase Admin SDK — used to write to Firestore bypassing security rules
@@ -278,7 +287,7 @@ const server = http.createServer(async (req, res) => {
             // Gym pilot tracking: if this signup used one of the known gym pilot coupons
             // (100% off for N months), remember which renewal coupon to auto-apply once
             // that free period ends — see PILOT_RENEWAL_COUPONS below.
-            const renewalCoupon = cuponUsado && PILOT_RENEWAL_COUPONS[cuponUsado] ? PILOT_RENEWAL_COUPONS[cuponUsado] : null;
+            const renewalCoupon = buscarCuponRenovacion(cuponUsado);
 
             await admin.firestore().collection('usuarios').doc(uid).set({
               suscripcion: {
@@ -450,7 +459,8 @@ const server = http.createServer(async (req, res) => {
         const porGym = {};
         snap.forEach(doc => {
           const s = doc.data().suscripcion || {};
-          const config = GYM_COMMISSIONS[s.cuponUsado];
+          const claveGym = Object.keys(GYM_COMMISSIONS).find(k => s.cuponUsado && k.toUpperCase() === s.cuponUsado.toUpperCase());
+          const config = claveGym ? GYM_COMMISSIONS[claveGym] : null;
           if (!config) return; // socio came from a pilot coupon not (yet) in the commission map
           if (!porGym[config.gimnasio]) porGym[config.gimnasio] = { sociosActivos: 0, aPagarEsteMes: 0 };
           porGym[config.gimnasio].sociosActivos += 1;
