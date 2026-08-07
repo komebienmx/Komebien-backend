@@ -509,12 +509,16 @@ const server = http.createServer(async (req, res) => {
         }
         const userDoc = snap.docs[0];
         const s = userDoc.data().suscripcion || {};
-        const resultado = { uid: userDoc.id, cuponUsado: s.cuponUsado, accion: null };
+        // Recompute renewalCoupon live (not just trust the stored value) — this user's
+        // record may have been written before the case-insensitivity fix, so the stored
+        // field could be stale/missing even though the coupon really does match today.
+        const renewalCoupon = s.renewalCoupon || buscarCuponRenovacion(s.cuponUsado);
+        const resultado = { uid: userDoc.id, cuponUsado: s.cuponUsado, renewalCoupon, accion: null };
 
-        if (s.renewalCoupon) {
-          await stripe.subscriptions.update(stripeSubscriptionId, { coupon: s.renewalCoupon });
-          await userDoc.ref.set({ suscripcion: { renewalCouponApplied: true, renewalAppliedFecha: new Date().toISOString() } }, { merge: true });
-          resultado.accion = `Cupón de renovación "${s.renewalCoupon}" aplicado (simulado)`;
+        if (renewalCoupon) {
+          await stripe.subscriptions.update(stripeSubscriptionId, { coupon: renewalCoupon });
+          await userDoc.ref.set({ suscripcion: { renewalCoupon, renewalCouponApplied: true, renewalAppliedFecha: new Date().toISOString() } }, { merge: true });
+          resultado.accion = `Cupón de renovación "${renewalCoupon}" aplicado (simulado)`;
         } else if (s.cuponUsado && /50$/i.test(s.cuponUsado)) {
           const referrerName = s.cuponUsado.replace(/50$/i, '');
           await userDoc.ref.set({ suscripcion: { referidoConfirmado: true, referidoPor: referrerName, referidoConfirmadoFecha: new Date().toISOString() } }, { merge: true });
